@@ -38,7 +38,19 @@ st.set_page_config(page_title="The Four Horsemen", page_icon="H", layout="wide")
 C = {"bg": "#0a0a0c", "panel": "#121215", "panel2": "#17171b", "line": "#26262c",
      "text": "#e8e8ea", "dim": "#8a8a92", "red": "#ff4d4d", "redDim": "#5c2526",
      "green": "#3ddc84", "amber": "#ffb020", "blue": "#5b9dff"}
-UA = {"User-Agent": "FourHorsemen Dashboard admin@fourhorsemen.app"}
+UA = {"User-Agent": "FourHorsemen Dashboard giofanale@gmail.com"}
+SEC_HEADERS = {
+    "User-Agent": "FourHorsemen Dashboard giofanale@gmail.com",
+    "Accept": "application/json, text/html, */*",
+    "Accept-Encoding": "gzip, deflate",
+    "Host": "data.sec.gov",
+}
+SEC_ARCHIVE_HEADERS = {
+    "User-Agent": "FourHorsemen Dashboard giofanale@gmail.com",
+    "Accept": "text/html, */*",
+    "Accept-Encoding": "gzip, deflate",
+    "Host": "www.sec.gov",
+}
 # Browser-like headers to get past Cloudflare bot detection (Farside, etc.)
 BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -127,33 +139,59 @@ def _parse_farside_html(h):
 
 
 @st.cache_data(ttl=900)
-def fetch_etf_flows(coinglass_key=""):
-    """Multi-source. 1) Coinglass API if a key is provided, 2) Farside w/ browser
-    headers + retries, 3) SoSoValue JSON. Returns ok:False only if all fail."""
-    # 1) Coinglass (most reliable; needs free key)
+def fetch_etf_flows(coinglass_key="", github_csv_url=""):
+    """Multi-source ETF flows. Tries in order and records why each failed.
+    1) Coinglass API (needs free key)  2) GitHub raw CSV (cloud-friendly, no block)
+    3) Farside (Cloudflare)  4) SoSoValue JSON. Returns ok:False only if all fail."""
+    tried = []
+    # 1) Coinglass
     if coinglass_key:
         try:
             r = requests.get("https://open-api-v4.coinglass.com/api/etf/bitcoin/flow-history",
                              headers={"CG-API-KEY": coinglass_key, "Accept": "application/json"}, timeout=12)
-            rows = r.json().get("data", [])
-            rows = sorted(rows, key=lambda x: x.get("timestamp", 0))
+            rows = sorted(r.json().get("data", []), key=lambda x: x.get("timestamp", 0))
             flows = [(x["timestamp"], x.get("flow_usd", 0) / 1e6) for x in rows if "flow_usd" in x]
             if flows:
                 import datetime as _dt
                 d = _dt.datetime.utcfromtimestamp(flows[-1][0] / 1000).strftime("%d %b %Y")
                 return {"ok": True, "date": d, "today": flows[-1][1],
-                        "d5": sum(f for _, f in flows[-5:]), "src": "Coinglass"}
-        except Exception:
-            pass
-    # 2) Farside with browser headers + retries
+                        "d5": sum(f for _, f in flows[-5:]), "src": "Coinglass", "tried": tried}
+            tried.append(f"Coinglass HTTP {r.status_code} (no rows)")
+        except Exception as e:
+            tried.append(f"Coinglass err {e}")
+    else:
+        tried.append("Coinglass skipped (no key)")
+    # 2) GitHub raw CSV (only if user supplied a URL; raw.githubusercontent.com is allow-listed)
+    if github_csv_url:
+        try:
+            txt = requests.get(github_csv_url, headers=BROWSER, timeout=12).text
+            df = pd.read_csv(io.StringIO(txt))
+            # find a date col and a total/net col
+            cols = {c.lower(): c for c in df.columns}
+            datec = next((cols[c] for c in cols if "date" in c), df.columns[0])
+            totalc = next((cols[c] for c in cols if c in ("total", "net", "net_flow", "sum")), None)
+            if totalc:
+                df = df[[datec, totalc]].dropna()
+                df[totalc] = df[totalc].apply(_num)
+                df = df.dropna(subset=[totalc]).sort_values(datec)
+                return {"ok": True, "date": str(df.iloc[-1][datec]), "today": float(df.iloc[-1][totalc]),
+                        "d5": float(df[totalc].tail(5).sum()), "src": "GitHub CSV", "tried": tried}
+            tried.append("GitHub CSV: no total/net column")
+        except Exception as e:
+            tried.append(f"GitHub CSV err {e}")
+    # 3) Farside
     for attempt in range(3):
         try:
-            h = requests.get("https://farside.co.uk/btc/", headers=BROWSER, timeout=15).text
-            if "Total" in h:
-                return _parse_farside_html(h)
-        except Exception:
+            r = requests.get("https://farside.co.uk/btc/", headers=BROWSER, timeout=15)
+            if "Total" in r.text:
+                out = _parse_farside_html(r.text); out["tried"] = tried; return out
+            tried.append(f"Farside HTTP {r.status_code} (no table)")
+            break
+        except Exception as e:
+            if attempt == 2:
+                tried.append(f"Farside err {e}")
             time.sleep(1)
-    # 3) SoSoValue JSON fallback
+    # 4) SoSoValue
     try:
         r = requests.get("https://api.sosovalue.com/openapi/v2/etf/historicalInflowChart",
                          headers={**BROWSER, "Accept": "application/json"},
@@ -169,10 +207,11 @@ def fetch_etf_flows(coinglass_key=""):
         if norm:
             norm.sort()
             return {"ok": True, "date": norm[-1][0], "today": norm[-1][1],
-                    "d5": sum(v for _, v in norm[-5:]), "src": "SoSoValue"}
+                    "d5": sum(v for _, v in norm[-5:]), "src": "SoSoValue", "tried": tried}
+        tried.append(f"SoSoValue HTTP {r.status_code} (no rows)")
     except Exception as e:
-        return {"ok": False, "err": f"all ETF sources failed ({e})"}
-    return {"ok": False, "err": "all ETF sources failed"}
+        tried.append(f"SoSoValue err {e}")
+    return {"ok": False, "err": " | ".join(tried), "tried": tried}
 
 
 @st.cache_data(ttl=120)
@@ -250,7 +289,7 @@ def fetch_strategy_fundamentals():
            "strc_rate": None, "bps_sats": None, "shares_m": None,
            "filing_date": None, "err": None, "http": None, "checked": 0}
     try:
-        r0 = requests.get(f"https://data.sec.gov/submissions/CIK{CIK}.json", headers=UA, timeout=12)
+        r0 = requests.get(f"https://data.sec.gov/submissions/CIK{CIK}.json", headers=SEC_HEADERS, timeout=12)
         out["http"] = r0.status_code
         if r0.status_code != 200:
             out["err"] = f"submissions HTTP {r0.status_code}"
@@ -269,7 +308,7 @@ def fetch_strategy_fundamentals():
             acc = accns[i].replace("-", "")
             url = f"https://www.sec.gov/Archives/edgar/data/{int(CIK)}/{acc}/{docs[i]}"
             try:
-                t = requests.get(url, headers=UA, timeout=12).text
+                t = requests.get(url, headers=SEC_ARCHIVE_HEADERS, timeout=12).text
                 t = re.sub(r"<[^>]+>", " ", t)
                 t = html.unescape(re.sub(r"\s+", " ", t))
             except Exception:
@@ -358,7 +397,11 @@ st.sidebar.markdown("### SETTINGS")
 coinglass_key = st.sidebar.text_input(
     "Coinglass API key (optional)", value="", type="password",
     help="Optional. Makes ETF flows rock-solid. Free key at coinglass.com. "
-         "Without it the app uses Farside + SoSoValue.")
+         "Without it the app tries GitHub CSV, Farside and SoSoValue.")
+github_csv_url = st.sidebar.text_input(
+    "ETF CSV raw URL (optional)", value="",
+    help="A raw.githubusercontent.com CSV of daily BTC ETF flows with a date column "
+         "and a 'total'/'net' column. Cloud-friendly fallback that bypasses Cloudflare.")
 auto_refresh = st.sidebar.checkbox("Auto-refresh (30s)", value=True)
 show_diag = st.sidebar.checkbox("Show data-source diagnostics", value=False,
     help="Shows exactly which live source succeeded or failed, with HTTP codes.")
@@ -370,7 +413,7 @@ st.sidebar.caption("All other data is fetched live and automatically. "
 # ============================================================================
 with st.spinner("Pulling live data from Coinbase, ETF sources, Stooq, SEC EDGAR, Yahoo…"):
     p = fetch_premium()
-    etf = fetch_etf_flows(coinglass_key)
+    etf = fetch_etf_flows(coinglass_key, github_csv_url)
     strc_price, strc_src = price_of("strc.us", "STRC")
     mstr_price, mstr_src = price_of("mstr.us", "MSTR")
     fund = fetch_strategy_fundamentals()
@@ -588,7 +631,8 @@ if show_diag:
     lines.append(f"{stat(p.get('ok'))} **Coinbase premium** — " +
                  (f"OK via {p.get('ref_name')}" if p.get("ok") else f"FAIL: {p.get('err','?')}"))
     lines.append(f"{stat(etf.get('ok'))} **ETF flows** — " +
-                 (f"OK via {etf.get('src')}: today {etf.get('today'):.1f}M" if etf.get("ok") else f"FAIL: {etf.get('err','?')}"))
+                 (f"OK via {etf.get('src')}: today {etf.get('today'):.1f}M" if etf.get("ok")
+                  else f"FAIL. Attempts: {' | '.join(etf.get('tried', []))}"))
     lines.append(f"{stat(strc_price is not None)} **STRC price** — " +
                  (f"${strc_price:,.2f} via {strc_src}" if strc_price else "FAIL: Stooq + Yahoo both down"))
     lines.append(f"{stat(mstr_price is not None)} **MSTR price** — " +
