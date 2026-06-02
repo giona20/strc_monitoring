@@ -1,18 +1,53 @@
-# 🐎 The Four Horsemen — Crypto Liquidity Rotation Dashboard
+# The Four Horsemen - Crypto Liquidity Rotation Dashboard
 
-Tracks the four signals that matter when liquidity is leaving crypto:
+Four signals that matter when liquidity is leaving crypto, in one screen.
+**Everything is fetched live. No manual inputs, no default values, no mock data.**
+If a source is unreachable, that card shows `NO DATA` and is excluded from the composite —
+the app never invents a number.
 
-1. **STRC** — Strategy's perpetual preferred, dividend doom-loop watch (below $100 par = stressed)
-2. **MSTR mNAV** — premium/discount to NAV (sub-1.0× = capitulation / bottoming zone)
-3. **Spot BTC ETF flows** — net creation/redemption (billions out = institutional exit)
-4. **Coinbase premium** — US spot demand proxy (deeply negative = US selling)
+1. **STRC** - Strategy's perpetual preferred; below $100 par = dividend stress / doom-loop risk
+2. **MSTR mNAV** - premium/discount to NAV, shown both ways (Enterprise Value + Equity)
+3. **Spot BTC ETF flows** - net creation/redemption (billions out = institutional exit)
+4. **Coinbase premium** - US spot demand proxy (negative = US selling)
 
-A composite score rolls all four into a single RISK-OFF / NEUTRAL / RISK-ON readout.
+Plus a scrolling **STRC/MSTR news bar**, a plain-English **situation summary**, a live
+**fundamentals strip**, and a **for-dummies guide** (Italian).
 
-## Live vs. manual
+## Every value is live (all free, no API key)
 
-- **Coinbase premium** is fetched server-side every 15s (Coinbase spot vs. Binance spot) — no CORS issues.
-- **STRC, mNAV, ETF flows** are manual inputs in the sidebar — no clean free API exists for them. Update from your own feeds; ETF flows link out to [Farside Investors](https://farside.co.uk/btc/).
+| Data | Source | How | Refresh |
+|---|---|---|---|
+| Coinbase premium | Coinbase vs Binance spot (OKX fallback) | REST | 15s |
+| ETF flows | Farside Investors | `pandas.read_html` table scrape | 15m |
+| STRC / MSTR price | Stooq (Yahoo fallback) | CSV / chart API | 2m |
+| **BTC holdings** | SEC EDGAR | regex scrape of Strategy's latest 8-K | 30m |
+| **Convertible debt** | SEC EDGAR | 8-K capital-structure update | 30m |
+| **Preferred outstanding** | SEC EDGAR | 8-K capital-structure update | 30m |
+| **USD reserve** | SEC EDGAR | 8-K | 30m |
+| **STRC dividend rate** | SEC EDGAR | 8-K | 30m |
+| Diluted shares | SEC EDGAR XBRL | `companyconcept` API | 1h |
+| News | Yahoo Finance RSS (MSTR+STRC) | feed | 15m |
+| mNAV (EV + equity) | computed from the above | — | live |
+
+### How the SEC scraper works
+
+Strategy files an 8-K almost every week. The app calls the SEC submissions API
+(`data.sec.gov/submissions/CIK0001050446.json`), walks the most recent 8-K filings newest-first,
+strips HTML, and regex-extracts each metric. It takes the newest value found per field — so BTC
+holdings / reserve / STRC rate come from the latest weekly filing, while debt and preferred come
+from the most recent capital-structure update that mentioned them. It stops as soon as all fields
+are filled. Verified against the filings dated 1 Jun 2026 and 26 May 2026:
+BTC 843,706 · debt $6.7B · preferred $15.5B · reserve $900M · STRC 11.50% → **mNAV EV 1.21× / equity 0.84×**.
+
+### mNAV, both ways
+
+```
+EV mNAV     = (market cap + debt + preferred - cash) / (BTC holdings x BTC price)
+Equity mNAV =  market cap                            / (BTC holdings x BTC price)
+```
+
+EV matches Strategy.com (~1.21×). Equity is stricter (~0.84×) — below 1.0 the common is worth
+less than its bare bitcoin, the classic capitulation signal. The card flags red if either crosses 1.0.
 
 ## Run locally
 
@@ -23,22 +58,30 @@ streamlit run app.py
 
 ## Deploy on Streamlit Community Cloud
 
-1. Push this folder to a **public** GitHub repo (see below).
-2. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub.
-3. Click **New app**, pick your repo, set **Main file path** to `app.py`, deploy.
+1. Push to a **public** GitHub repo (commands below).
+2. [share.streamlit.io](https://share.streamlit.io) -> New app -> pick repo -> `app.py` -> Deploy.
 
 ## Push to GitHub
 
 ```bash
-cd four-horsemen
-git init
 git add .
-git commit -m "Four Horsemen dashboard"
-git branch -M main
-git remote add origin https://github.com/<your-username>/four-horsemen.git
-git push -u origin main
+git commit -m "v3: fully live, SEC 8-K scraper, no defaults/mock"
+git push
 ```
+
+(First time: `git init && git branch -M main && git remote add origin <url> && git push -u origin main`.
+GitHub HTTPS needs a Personal Access Token instead of a password.)
+
+## Gotchas
+
+- **SEC User-Agent**: `data.sec.gov` requires a descriptive User-Agent and rate-limits to ~10 req/s
+  (already handled; results cached 30m). If SEC blocks, the fundamentals strip shows `n/a` and the
+  mNAV card shows `NO DATA` rather than a guess.
+- **Binance geoblock** on US-based Streamlit Cloud (HTTP 451) -> auto-falls back to OKX.
+- **8-K wording changes**: if Strategy changes its press-release phrasing, update the regexes in
+  `fetch_strategy_fundamentals` (`_btc_holdings`, `_debt_m`, `_pref_m`, `_reserve_m`, `_strc_rate`).
+- **Farside layout change** -> adjust `fetch_etf_flows`.
 
 ---
 
-*Not financial advice. Premium feed depends on Coinbase/Binance public APIs being reachable.*
+*Not financial advice.*
