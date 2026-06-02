@@ -82,6 +82,21 @@ GitHub HTTPS needs a Personal Access Token instead of a password.)
   `fetch_strategy_fundamentals` (`_btc_holdings`, `_debt_m`, `_pref_m`, `_reserve_m`, `_strc_rate`).
 - **Farside layout change** -> adjust `fetch_etf_flows`.
 
+## Debugging NO DATA (read this first)
+
+Turn on **"Show data-source diagnostics"** in the sidebar. It prints exactly which source
+succeeded or failed and the HTTP code — no more guessing. Most likely causes on Streamlit Cloud:
+
+- **SEC 8-K shows HTTP 403**: SEC rejects generic User-Agents and fake emails, and has blocked
+  cloud IP ranges. Set a *real* email in the `UA` string at the top of `app.py`
+  (e.g. `"YourName yourreal@email.com"`). Wait 10 min if you were already blocked.
+- **mNAV NO DATA was caused by shares**: fixed. Share count is now derived directly from the
+  "Bitcoin Per Share (in sats)" figure in the same 8-K (shares = holdings x 1e8 / BPS_sats),
+  so it no longer depends on Yahoo or SEC-XBRL — both of which block cloud IPs. mNAV now needs
+  only the 8-K (holdings, BPS, debt, pref, reserve) + the live BTC price + MSTR price (Stooq).
+- **ETF NO DATA**: Farside is behind Cloudflare and SoSoValue's public endpoint can rate-limit
+  cloud IPs. The robust fix is a free **Coinglass API key** in the sidebar — it's tried first.
+
 ## If a card shows NO DATA
 
 The app never fakes a number — if a source is unreachable that card goes grey. Common cases:

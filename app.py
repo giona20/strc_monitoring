@@ -38,7 +38,7 @@ st.set_page_config(page_title="The Four Horsemen", page_icon="H", layout="wide")
 C = {"bg": "#0a0a0c", "panel": "#121215", "panel2": "#17171b", "line": "#26262c",
      "text": "#e8e8ea", "dim": "#8a8a92", "red": "#ff4d4d", "redDim": "#5c2526",
      "green": "#3ddc84", "amber": "#ffb020", "blue": "#5b9dff"}
-UA = {"User-Agent": "FourHorsemen/3.0 dashboard contact@example.com"}
+UA = {"User-Agent": "FourHorsemen Dashboard admin@fourhorsemen.app"}
 # Browser-like headers to get past Cloudflare bot detection (Farside, etc.)
 BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -235,44 +235,59 @@ def _strc_rate(t):
     if m: return float(m.group(1))
     return None
 
+def _bps_sats(t):
+    # "220,900 Bitcoin Per Share (in sats)"
+    m = re.search(r"([\d,]{4,})\s+Bitcoin Per Share", t, re.I)
+    if m: return int(m.group(1).replace(",", ""))
+    return None
+
 
 @st.cache_data(ttl=1800)
 def fetch_strategy_fundamentals():
     """Scrape Strategy's most recent 8-K filings on SEC EDGAR for live balance-sheet data.
     Returns dict of values; each key is None if not found in any recent filing."""
     out = {"btc": None, "debt_m": None, "pref_m": None, "reserve_m": None,
-           "strc_rate": None, "filing_date": None, "err": None}
+           "strc_rate": None, "bps_sats": None, "shares_m": None,
+           "filing_date": None, "err": None, "http": None, "checked": 0}
     try:
-        sub = requests.get(f"https://data.sec.gov/submissions/CIK{CIK}.json", headers=UA, timeout=12).json()
+        r0 = requests.get(f"https://data.sec.gov/submissions/CIK{CIK}.json", headers=UA, timeout=12)
+        out["http"] = r0.status_code
+        if r0.status_code != 200:
+            out["err"] = f"submissions HTTP {r0.status_code}"
+            return out
+        sub = r0.json()
         recent = sub["filings"]["recent"]
         forms = recent["form"]; accns = recent["accessionNumber"]
         docs = recent["primaryDocument"]; dates = recent["filingDate"]
-        # iterate newest -> older 8-Ks, fill any still-missing field
         checked = 0
         for i in range(len(forms)):
             if forms[i] != "8-K":
                 continue
             checked += 1
-            if checked > 8:
+            if checked > 10:
                 break
             acc = accns[i].replace("-", "")
             url = f"https://www.sec.gov/Archives/edgar/data/{int(CIK)}/{acc}/{docs[i]}"
             try:
                 t = requests.get(url, headers=UA, timeout=12).text
-                t = re.sub(r"<[^>]+>", " ", t)  # strip tags
+                t = re.sub(r"<[^>]+>", " ", t)
                 t = html.unescape(re.sub(r"\s+", " ", t))
             except Exception:
                 continue
             if out["filing_date"] is None:
                 out["filing_date"] = dates[i]
             for key, fn in [("btc", _btc_holdings), ("debt_m", _debt_m), ("pref_m", _pref_m),
-                            ("reserve_m", _reserve_m), ("strc_rate", _strc_rate)]:
+                            ("reserve_m", _reserve_m), ("strc_rate", _strc_rate), ("bps_sats", _bps_sats)]:
                 if out[key] is None:
                     v = fn(t)
                     if v is not None:
                         out[key] = v
-            if all(out[k] is not None for k in ("btc", "debt_m", "pref_m", "reserve_m", "strc_rate")):
+            if all(out[k] is not None for k in ("btc", "debt_m", "pref_m", "reserve_m", "strc_rate", "bps_sats")):
                 break
+        out["checked"] = checked
+        # derive assumed-diluted shares from BPS: shares = holdings * 1e8 / bps_sats
+        if out["btc"] and out["bps_sats"]:
+            out["shares_m"] = (out["btc"] * 1e8 / out["bps_sats"]) / 1e6
         return out
     except Exception as e:
         out["err"] = str(e)
@@ -345,6 +360,8 @@ coinglass_key = st.sidebar.text_input(
     help="Optional. Makes ETF flows rock-solid. Free key at coinglass.com. "
          "Without it the app uses Farside + SoSoValue.")
 auto_refresh = st.sidebar.checkbox("Auto-refresh (30s)", value=True)
+show_diag = st.sidebar.checkbox("Show data-source diagnostics", value=False,
+    help="Shows exactly which live source succeeded or failed, with HTTP codes.")
 st.sidebar.caption("All other data is fetched live and automatically. "
                    "No values are entered by hand.")
 
@@ -367,7 +384,9 @@ debt_m = fund.get("debt_m")
 preferred_m = fund.get("pref_m")
 cash_m = fund.get("reserve_m")
 strc_rate = fund.get("strc_rate")
-shares_m = (sec_shares / 1e6) if sec_shares else None
+# shares: prefer BPS-derived (from same 8-K), then SEC XBRL, else None
+shares_m = fund.get("shares_m") or ((sec_shares / 1e6) if sec_shares else None)
+shares_src = "8-K BPS" if fund.get("shares_m") else ("SEC XBRL" if sec_shares else None)
 
 # ============================================================================
 # COMPUTE mNAV
@@ -559,6 +578,40 @@ st.markdown(f"<div class='srcline'>LIVE STRATEGY FUNDAMENTALS (SEC 8-K): "
             if btc_holdings else "<div class='srcline'>Strategy fundamentals unavailable from SEC right now.</div>",
             unsafe_allow_html=True)
 st.write("")
+
+# ============================================================================
+# DIAGNOSTICS PANEL
+# ============================================================================
+if show_diag:
+    def stat(ok): return "✅" if ok else "❌"
+    lines = []
+    lines.append(f"{stat(p.get('ok'))} **Coinbase premium** — " +
+                 (f"OK via {p.get('ref_name')}" if p.get("ok") else f"FAIL: {p.get('err','?')}"))
+    lines.append(f"{stat(etf.get('ok'))} **ETF flows** — " +
+                 (f"OK via {etf.get('src')}: today {etf.get('today'):.1f}M" if etf.get("ok") else f"FAIL: {etf.get('err','?')}"))
+    lines.append(f"{stat(strc_price is not None)} **STRC price** — " +
+                 (f"${strc_price:,.2f} via {strc_src}" if strc_price else "FAIL: Stooq + Yahoo both down"))
+    lines.append(f"{stat(mstr_price is not None)} **MSTR price** — " +
+                 (f"${mstr_price:,.2f} via {mstr_src}" if mstr_price else "FAIL: Stooq + Yahoo both down"))
+    lines.append(f"{stat(btc_holdings is not None)} **SEC 8-K fundamentals** — " +
+                 (f"OK (filing {fund.get('filing_date')}, checked {fund.get('checked')} 8-Ks): "
+                  f"BTC={btc_holdings}, debt={debt_m}, pref={preferred_m}, reserve={cash_m}, "
+                  f"BPS={fund.get('bps_sats')}, strc_rate={strc_rate}"
+                  if btc_holdings else f"FAIL: HTTP {fund.get('http')} / {fund.get('err','?')}"))
+    lines.append(f"{stat(shares_m is not None)} **Shares** — " +
+                 (f"{shares_m:,.1f}M via {shares_src}" if shares_m else "FAIL: no BPS, no XBRL"))
+    lines.append(f"{stat(mcap is not None)} **Market cap** — " +
+                 (f"${mcap/1e9:,.1f}B via {mcap_src}" if mcap else "FAIL: need price×shares or Yahoo"))
+    lines.append(f"{stat(mnav_eq is not None)} **mNAV** — " +
+                 (f"EV {mnav_ev:.2f} / eq {mnav_eq:.2f}" if mnav_eq else f"FAIL: {mnav_note}"))
+    lines.append(f"{stat(bool(news))} **News** — " + (f"{len(news)} headlines" if news else "FAIL: empty feed"))
+    st.markdown(f"""<div class="box" style="border-color:{C['amber']}">
+    <div style="font-size:11px;letter-spacing:1.5px;color:{C['amber']};margin-bottom:8px">DATA-SOURCE DIAGNOSTICS</div>
+    <div class="dummies" style="font-family:monospace;font-size:12px">{'<br>'.join(lines)}</div>
+    <div class="srcline" style="margin-top:10px">Tip: if SEC shows HTTP 403, set a real email in the UA string (top of app.py).
+    If ETF/Yahoo fail on Streamlit Cloud, those IPs may be blocked — add a Coinglass key for ETF.</div>
+    </div>""", unsafe_allow_html=True)
+    st.write("")
 
 # ============================================================================
 # GUIDE FOR DUMMIES
