@@ -298,18 +298,33 @@ def fetch_strategy_fundamentals():
             if checked > 10:
                 break
             acc = accns[i].replace("-", "")
-            url = f"https://www.sec.gov/Archives/edgar/data/{int(CIK)}/{acc}/{docs[i]}"
+            base = f"https://www.sec.gov/Archives/edgar/data/{int(CIK)}/{acc}"
+            # The primary doc is often just the cover page; the data lives in exhibit 99.1.
+            # Fetch the filing index to find ALL .htm documents, then scan each.
+            doc_urls = [f"{base}/{docs[i]}"]
             try:
-                rr = requests.get(url, headers=SEC_ARCHIVE_HEADERS, timeout=12)
-                raw = rr.text
-                t = re.sub(r"<[^>]+>", " ", raw)
-                t = html.unescape(re.sub(r"\s+", " ", t))
-                if checked <= 3:
-                    hit = "BTC" if ("bitcoin" in t.lower() or "btc holdings" in t.lower()) else "no-btc"
-                    out["doc_log"].append(f"8-K {dates[i]} HTTP {rr.status_code} len={len(t)} {hit} doc={docs[i]}")
-            except Exception as e:
-                out["doc_log"].append(f"8-K {dates[i]} fetch ERR {e}")
-                continue
+                idx = requests.get(f"{base}/", headers=SEC_ARCHIVE_HEADERS, timeout=12).text
+                for m in re.findall(r'href="([^"]+\.htm)"', idx, re.I):
+                    name = m.split("/")[-1]
+                    full = f"{base}/{name}"
+                    if full not in doc_urls and ("ex99" in name.lower() or "ex_" in name.lower()
+                                                  or re.search(r"ex\d", name.lower())):
+                        doc_urls.append(full)
+            except Exception:
+                pass
+            combined = ""
+            for du in doc_urls[:4]:
+                try:
+                    rr = requests.get(du, headers=SEC_ARCHIVE_HEADERS, timeout=12)
+                    raw = rr.text
+                    tt = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", raw)))
+                    combined += " " + tt
+                except Exception as e:
+                    out["doc_log"].append(f"8-K {dates[i]} doc fetch ERR {e}")
+            t = combined
+            if checked <= 3:
+                hit = "BTC" if "bitcoin" in t.lower() else "no-btc"
+                out["doc_log"].append(f"8-K {dates[i]} docs={len(doc_urls)} len={len(t)} {hit}")
             if out["filing_date"] is None:
                 out["filing_date"] = dates[i]
             for key, fn in [("btc", _btc_holdings), ("debt_m", _debt_m), ("pref_m", _pref_m),
@@ -331,25 +346,24 @@ def fetch_strategy_fundamentals():
 
 @st.cache_data(ttl=3600)
 def sec_shares_outstanding():
-    """Try several XBRL tags; return shares outstanding or None."""
-    tags = [("dei", "EntityCommonStockSharesOutstanding"),
-            ("us-gaap", "CommonStockSharesOutstanding"),
-            ("us-gaap", "CommonStockSharesIssued")]
-    for tax, tag in tags:
-        try:
-            url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{CIK}/{tax}/{tag}.json"
-            d = requests.get(url, headers=UA, timeout=12).json()
-            vals = []
-            for unit in d.get("units", {}).values():
-                for it in unit:
-                    if it.get("val") and it.get("end"):
-                        vals.append((it["end"], it["val"]))
-            if vals:
-                vals.sort()
-                return vals[-1][1]
-        except Exception:
-            continue
-    return None
+    """Sum the most recent share count across all classes from companyfacts XBRL."""
+    try:
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{CIK}.json"
+        d = requests.get(url, headers=SEC_HEADERS, timeout=15).json()
+        dei = d.get("facts", {}).get("dei", {})
+        concept = dei.get("EntityCommonStockSharesOutstanding")
+        if not concept:
+            return None
+        # facts may carry multiple classes via different members; take the latest 'end'
+        # per distinct accession, then sum the classes reported on that latest date.
+        rows = concept.get("units", {}).get("shares", [])
+        if not rows:
+            return None
+        latest_end = max(r["end"] for r in rows if r.get("end"))
+        total = sum(r["val"] for r in rows if r.get("end") == latest_end)
+        return total if total > 0 else None
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=300)
