@@ -39,6 +39,15 @@ C = {"bg": "#0a0a0c", "panel": "#121215", "panel2": "#17171b", "line": "#26262c"
      "text": "#e8e8ea", "dim": "#8a8a92", "red": "#ff4d4d", "redDim": "#5c2526",
      "green": "#3ddc84", "amber": "#ffb020", "blue": "#5b9dff"}
 UA = {"User-Agent": "FourHorsemen/3.0 dashboard contact@example.com"}
+# Browser-like headers to get past Cloudflare bot detection (Farside, etc.)
+BROWSER = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
 CIK = "0001050446"  # Strategy Inc (MSTR)
 
 st.markdown(f"""
@@ -102,31 +111,75 @@ def _num(v):
         return None
 
 
+def _parse_farside_html(h):
+    tables = pd.read_html(io.StringIO(h))
+    df = max(tables, key=lambda t: t.shape[0] * t.shape[1])
+    df.columns = [str(c[-1]) if isinstance(c, tuple) else str(c) for c in df.columns]
+    tcol = [c for c in df.columns if c.strip().lower() == "total"][0]
+    labels = df.iloc[:, 0].astype(str)
+    mask = ~labels.str.strip().str.lower().isin(["total", "average", "maximum", "minimum", "nan"])
+    data = df[mask].copy()
+    data["net"] = data[tcol].apply(_num)
+    data = data.dropna(subset=["net"])
+    latest = data.iloc[-1]
+    return {"ok": True, "date": str(latest.iloc[0]), "today": float(latest["net"]),
+            "d5": float(data["net"].tail(5).sum()), "src": "Farside"}
+
+
 @st.cache_data(ttl=900)
-def fetch_etf_flows():
+def fetch_etf_flows(coinglass_key=""):
+    """Multi-source. 1) Coinglass API if a key is provided, 2) Farside w/ browser
+    headers + retries, 3) SoSoValue JSON. Returns ok:False only if all fail."""
+    # 1) Coinglass (most reliable; needs free key)
+    if coinglass_key:
+        try:
+            r = requests.get("https://open-api-v4.coinglass.com/api/etf/bitcoin/flow-history",
+                             headers={"CG-API-KEY": coinglass_key, "Accept": "application/json"}, timeout=12)
+            rows = r.json().get("data", [])
+            rows = sorted(rows, key=lambda x: x.get("timestamp", 0))
+            flows = [(x["timestamp"], x.get("flow_usd", 0) / 1e6) for x in rows if "flow_usd" in x]
+            if flows:
+                import datetime as _dt
+                d = _dt.datetime.utcfromtimestamp(flows[-1][0] / 1000).strftime("%d %b %Y")
+                return {"ok": True, "date": d, "today": flows[-1][1],
+                        "d5": sum(f for _, f in flows[-5:]), "src": "Coinglass"}
+        except Exception:
+            pass
+    # 2) Farside with browser headers + retries
+    for attempt in range(3):
+        try:
+            h = requests.get("https://farside.co.uk/btc/", headers=BROWSER, timeout=15).text
+            if "Total" in h:
+                return _parse_farside_html(h)
+        except Exception:
+            time.sleep(1)
+    # 3) SoSoValue JSON fallback
     try:
-        h = requests.get("https://farside.co.uk/btc/", headers=UA, timeout=12).text
-        tables = pd.read_html(io.StringIO(h))
-        df = max(tables, key=lambda t: t.shape[0] * t.shape[1])
-        df.columns = [str(c[-1]) if isinstance(c, tuple) else str(c) for c in df.columns]
-        tcol = [c for c in df.columns if c.strip().lower() == "total"][0]
-        labels = df.iloc[:, 0].astype(str)
-        mask = ~labels.str.strip().str.lower().isin(["total", "average", "maximum", "minimum", "nan"])
-        data = df[mask].copy()
-        data["net"] = data[tcol].apply(_num)
-        data = data.dropna(subset=["net"])
-        latest = data.iloc[-1]
-        return {"ok": True, "date": str(latest.iloc[0]), "today": float(latest["net"]),
-                "d5": float(data["net"].tail(5).sum())}
+        r = requests.get("https://api.sosovalue.com/openapi/v2/etf/historicalInflowChart",
+                         headers={**BROWSER, "Accept": "application/json"},
+                         params={"type": "us-btc-spot"}, timeout=12)
+        j = r.json()
+        rows = j.get("data", {}).get("list") or j.get("data") or []
+        norm = []
+        for x in rows:
+            v = x.get("totalNetInflow", x.get("flow_usd"))
+            dt = x.get("date") or x.get("timestamp")
+            if v is not None and dt is not None:
+                norm.append((str(dt), float(v) / 1e6))
+        if norm:
+            norm.sort()
+            return {"ok": True, "date": norm[-1][0], "today": norm[-1][1],
+                    "d5": sum(v for _, v in norm[-5:]), "src": "SoSoValue"}
     except Exception as e:
-        return {"ok": False, "err": str(e)}
+        return {"ok": False, "err": f"all ETF sources failed ({e})"}
+    return {"ok": False, "err": "all ETF sources failed"}
 
 
 @st.cache_data(ttl=120)
 def stooq_quote(symbol):
     try:
         url = f"https://stooq.com/q/l/?s={symbol}&f=sd2t2ohlcv&h&e=csv"
-        df = pd.read_csv(io.StringIO(requests.get(url, headers=UA, timeout=10).text))
+        df = pd.read_csv(io.StringIO(requests.get(url, headers=BROWSER, timeout=10).text))
         c = float(df.iloc[0]["Close"])
         return c if c == c else None
     except Exception:
@@ -228,19 +281,37 @@ def fetch_strategy_fundamentals():
 
 @st.cache_data(ttl=3600)
 def sec_shares_outstanding():
+    """Try several XBRL tags; return shares outstanding or None."""
+    tags = [("dei", "EntityCommonStockSharesOutstanding"),
+            ("us-gaap", "CommonStockSharesOutstanding"),
+            ("us-gaap", "CommonStockSharesIssued")]
+    for tax, tag in tags:
+        try:
+            url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{CIK}/{tax}/{tag}.json"
+            d = requests.get(url, headers=UA, timeout=12).json()
+            vals = []
+            for unit in d.get("units", {}).values():
+                for it in unit:
+                    if it.get("val") and it.get("end"):
+                        vals.append((it["end"], it["val"]))
+            if vals:
+                vals.sort()
+                return vals[-1][1]
+        except Exception:
+            continue
+    return None
+
+
+@st.cache_data(ttl=300)
+def yahoo_marketcap(symbol):
+    """Market cap directly from Yahoo (fallback if SEC share count is unavailable)."""
     try:
-        url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{CIK}/dei/EntityCommonStockSharesOutstanding.json"
-        d = requests.get(url, headers=UA, timeout=12).json()
-        vals = []
-        for unit in d.get("units", {}).values():
-            for it in unit:
-                if it.get("val") and it.get("end"):
-                    vals.append((it["end"], it["val"]))
-        if vals:
-            vals.sort(); return vals[-1][1]
+        url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=price"
+        d = requests.get(url, headers=BROWSER, timeout=10).json()
+        mc = d["quoteSummary"]["result"][0]["price"]["marketCap"]["raw"]
+        return float(mc)
     except Exception:
         return None
-    return None
 
 
 @st.cache_data(ttl=900)
@@ -266,15 +337,28 @@ def verdict(s):
 
 
 # ============================================================================
+# SIDEBAR
+# ============================================================================
+st.sidebar.markdown("### SETTINGS")
+coinglass_key = st.sidebar.text_input(
+    "Coinglass API key (optional)", value="", type="password",
+    help="Optional. Makes ETF flows rock-solid. Free key at coinglass.com. "
+         "Without it the app uses Farside + SoSoValue.")
+auto_refresh = st.sidebar.checkbox("Auto-refresh (30s)", value=True)
+st.sidebar.caption("All other data is fetched live and automatically. "
+                   "No values are entered by hand.")
+
+# ============================================================================
 # FETCH EVERYTHING LIVE
 # ============================================================================
-with st.spinner("Pulling live data from Coinbase, Farside, Stooq, SEC EDGAR, Yahoo…"):
+with st.spinner("Pulling live data from Coinbase, ETF sources, Stooq, SEC EDGAR, Yahoo…"):
     p = fetch_premium()
-    etf = fetch_etf_flows()
+    etf = fetch_etf_flows(coinglass_key)
     strc_price, strc_src = price_of("strc.us", "STRC")
     mstr_price, mstr_src = price_of("mstr.us", "MSTR")
     fund = fetch_strategy_fundamentals()
     sec_shares = sec_shares_outstanding()
+    mcap_yahoo = yahoo_marketcap("MSTR")
     news = fetch_news()
 
 btc_price = p["btc"] if p.get("ok") else None
@@ -286,21 +370,34 @@ strc_rate = fund.get("strc_rate")
 shares_m = (sec_shares / 1e6) if sec_shares else None
 
 # ============================================================================
-# COMPUTE mNAV (only if all live inputs are present)
+# COMPUTE mNAV
+# Market cap: prefer MSTR price x SEC shares; fall back to Yahoo market cap.
+# mNAV needs only: market cap + BTC holdings + BTC price. EV adds debt/pref/cash.
 # ============================================================================
 mnav_ev = mnav_eq = btc_nav = mcap = None
+mcap_src = None
 mnav_note = ""
-if btc_price and btc_holdings and shares_m:
-    mcap = mstr_price * shares_m * 1e6 if mstr_price else None
+if mstr_price and shares_m:
+    mcap = mstr_price * shares_m * 1e6
+    mcap_src = f"{shares_m:,.1f}M sh x ${mstr_price:,.0f}"
+elif mcap_yahoo:
+    mcap = mcap_yahoo
+    mcap_src = "Yahoo market cap"
+
+if btc_price and btc_holdings and mcap:
     btc_nav = btc_holdings * btc_price
-    if mcap and btc_nav > 0:
+    if btc_nav > 0:
         mnav_eq = mcap / btc_nav
         if None not in (debt_m, preferred_m, cash_m):
             mnav_ev = (mcap + (debt_m + preferred_m - cash_m) * 1e6) / btc_nav
         else:
-            mnav_note = "EV n/a (missing debt/pref/reserve)"
+            mnav_note = "EV n/a (missing debt/pref/reserve from SEC)"
 else:
-    mnav_note = "waiting on BTC price / holdings / shares"
+    missing = []
+    if not btc_price: missing.append("BTC price")
+    if not btc_holdings: missing.append("holdings")
+    if not mcap: missing.append("market cap")
+    mnav_note = "waiting on " + " / ".join(missing)
 
 # ============================================================================
 # SCORES (only computed metrics contribute; missing ones are excluded)
@@ -436,9 +533,9 @@ if etf.get("ok"):
     e5 = f"{'+' if etf_5d>=0 else '-'}${abs(etf_5d):.1f}M"
     card(c3, "3. SPOT BTC ETF FLOWS", scores.get("etf"), et,
          C["red"] if etf_today < 0 else C["green"], f"{etf['date']} &middot; 5d {e5}",
-         extra=f"<div class='hm-sub' style='margin-top:8px'>live via Farside</div>", flag=etf_5d < -500)
+         extra=f"<div class='hm-sub' style='margin-top:8px'>live via {etf.get('src','?')}</div>", flag=etf_5d < -500)
 else:
-    card(c3, "3. SPOT BTC ETF FLOWS", None, "", "", "Farside unavailable")
+    card(c3, "3. SPOT BTC ETF FLOWS", None, "", "", "all ETF sources unavailable")
 
 # 4 Premium
 if p.get("ok"):
@@ -466,47 +563,49 @@ st.write("")
 # ============================================================================
 # GUIDE FOR DUMMIES
 # ============================================================================
-with st.expander("📖 Guida — cosa significano queste metriche (for dummies)"):
+with st.expander("📖 Guide — what these metrics mean (for dummies)"):
     st.markdown(f"""<div class="dummies">
-<b>L'idea di fondo.</b> Quando i soldi escono dalle crypto e vanno verso altro (azioni AI, robotica),
-si vedono 4 spie accendersi. Questo cruscotto le tiene tutte in un posto, con dati presi in tempo
-reale da fonti pubbliche. Se sono tutte rosse, il momento è di rischio: meglio stare fermi.<br><br>
+<b>The big idea.</b> When money leaves crypto and rotates into other things (AI stocks, robotics),
+four warning lights tend to switch on. This dashboard keeps all four in one place, pulling the
+numbers live from public sources. If they're all red, it's a high-risk moment — better to stay out.<br><br>
 
-<b>1. STRC — l'azione "doom-loop".</b> STRC è un'azione speciale (preferred) emessa da Strategy/MSTR
-che paga un dividendo alto (oggi ~11.5%). Il prezzo "giusto" è $100 (la "pari"). Se scende
-<b>sotto $100</b>, il mercato dubita che Strategy paghi il dividendo senza vendere bitcoin. Se per
-pagare vende BTC, il prezzo BTC scende, e la sua situazione peggiora ancora: è il "doom loop". Difatti
-il 1° giugno 2026 Strategy ha venduto 32 BTC proprio per pagare i dividendi del preferred.
-<i>Sotto $100 = spia rossa.</i><br><br>
+<b>1. STRC — the "doom-loop" stock.</b> STRC is a special preferred share issued by Strategy (MSTR)
+that pays a high dividend (currently ~11.5%). Its "correct" price is $100 (the "par"). If it falls
+<b>below $100</b>, the market doubts Strategy can pay the dividend without selling bitcoin. If it has
+to sell BTC to pay, the BTC price drops, which makes its situation worse — that's the "doom loop."
+In fact, on June 1, 2026 Strategy sold 32 BTC specifically to fund preferred dividends.
+<i>Below $100 = red light.</i><br><br>
 
-<b>2. mNAV — quanto paghi MSTR rispetto ai suoi bitcoin.</b> MSTR possiede tantissimi bitcoin
-(~843.700). mNAV = quante volte il suo valore supera quello dei bitcoin che ha. <b>Due versioni:</b><br>
-&nbsp;&nbsp;• <b>EV (enterprise value)</b>: include debiti e preferred. È il numero di Strategy.com.<br>
-&nbsp;&nbsp;• <b>Equity (solo azioni)</b>: più severo. Sotto <b>1.0</b> l'azione vale meno dei suoi
-bitcoin — segnale storico di "fondo"/capitolazione.<br>
-<i>Più scende verso 1.0 (e sotto), più ci si avvicina a un minimo.</i><br><br>
+<b>2. mNAV — how much you pay for MSTR vs. its bitcoin.</b> MSTR owns a huge amount of bitcoin
+(~843,700). mNAV is how many times its value exceeds the value of the bitcoin it holds.
+<b>Two versions are shown:</b><br>
+&nbsp;&nbsp;• <b>EV (enterprise value)</b>: includes debt and preferred. This is the number Strategy.com publishes.<br>
+&nbsp;&nbsp;• <b>Equity (stock only)</b>: stricter. Below <b>1.0</b> the stock is worth less than its own
+bitcoin — a historic "bottom"/capitulation signal.<br>
+<i>The closer it gets to 1.0 (and below), the closer to a bottom.</i><br><br>
 
-<b>3. Flussi ETF — i grandi entrano o escono?</b> Gli ETF spot su BTC (IBIT di BlackRock, ecc.)
-mostrano se gli istituzionali comprano o vendono. <b>Negativi per giorni</b> = miliardi in uscita.
-<i>Outflow su 5 giorni = spia rossa.</i><br><br>
+<b>3. ETF flows — are the big players coming in or out?</b> Spot BTC ETFs (BlackRock's IBIT, etc.)
+show whether institutions are buying or selling. <b>Negative for several days</b> = billions leaving.
+<i>5-day outflow = red light.</i><br><br>
 
-<b>4. Coinbase premium — USA o estero a vendere?</b> Confronta il BTC su Coinbase (USA) con un
-exchange estero (Binance/OKX). Se Coinbase è <b>più basso</b> (premium negativo), gli americani
-vendono più forte. <i>Negativo = spia rossa.</i><br><br>
+<b>4. Coinbase premium — is the US or offshore selling?</b> Compares BTC on Coinbase (US investors)
+with an offshore exchange (Binance/OKX). If Coinbase is <b>lower</b> (negative premium), Americans
+are selling harder. <i>Negative = red light.</i><br><br>
 
-<b>Punteggio composito (in alto).</b> Media delle spie disponibili in un numero 0–100.
-Rosso = liquidità in uscita, prudenza. Verde = liquidità di supporto. Se una fonte non risponde,
-quella spia viene esclusa dal calcolo (vedi "x/4 signals"), e <b>non</b> viene inventato alcun dato.<br><br>
+<b>The composite score (top).</b> The average of the available lights as a single 0–100 number.
+Red = liquidity leaving, be cautious. Green = liquidity supportive. If a source doesn't respond,
+that light is excluded from the calculation (see "x/4 signals") — <b>no number is ever made up</b>.<br><br>
 
-<b>Per il "turn" (inversione):</b> mNAV equity sotto 1.0 <i>insieme a</i> Coinbase premium che torna
-positivo. Storicamente è lì che si forma un minimo.
+<b>What to watch for the "turn" (reversal):</b> equity mNAV below 1.0 <i>together with</i> the
+Coinbase premium flipping positive. Historically that's where a bottom forms.
 </div>""", unsafe_allow_html=True)
 
+src_etf = etf.get("src", "Farside/SoSoValue") if etf.get("ok") else "ETF sources"
 st.markdown(f"<div class='srcline' style='margin-top:14px;text-align:center'>"
-            f"Live: premium (Coinbase/Binance-OKX 15s) &middot; ETF (Farside 15m) &middot; STRC/MSTR (Stooq+Yahoo 2m) &middot; "
+            f"Live: premium (Coinbase/Binance-OKX 15s) &middot; ETF ({src_etf} 15m) &middot; STRC/MSTR (Stooq+Yahoo 2m) &middot; "
             f"fundamentals (SEC EDGAR 8-K 30m) &middot; news (Yahoo RSS 15m). mNAV computed. No mock data. Not financial advice.</div>",
             unsafe_allow_html=True)
 
-if st.sidebar.checkbox("Auto-refresh (30s)", value=True):
+if auto_refresh:
     time.sleep(30)
     st.rerun()

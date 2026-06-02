@@ -18,7 +18,7 @@ Plus a scrolling **STRC/MSTR news bar**, a plain-English **situation summary**, 
 | Data | Source | How | Refresh |
 |---|---|---|---|
 | Coinbase premium | Coinbase vs Binance spot (OKX fallback) | REST | 15s |
-| ETF flows | Farside Investors | `pandas.read_html` table scrape | 15m |
+| ETF flows | Coinglass (key) -> Farside -> SoSoValue | API / browser-header scrape / JSON | 15m |
 | STRC / MSTR price | Stooq (Yahoo fallback) | CSV / chart API | 2m |
 | **BTC holdings** | SEC EDGAR | regex scrape of Strategy's latest 8-K | 30m |
 | **Convertible debt** | SEC EDGAR | 8-K capital-structure update | 30m |
@@ -81,6 +81,19 @@ GitHub HTTPS needs a Personal Access Token instead of a password.)
 - **8-K wording changes**: if Strategy changes its press-release phrasing, update the regexes in
   `fetch_strategy_fundamentals` (`_btc_holdings`, `_debt_m`, `_pref_m`, `_reserve_m`, `_strc_rate`).
 - **Farside layout change** -> adjust `fetch_etf_flows`.
+
+## If a card shows NO DATA
+
+The app never fakes a number — if a source is unreachable that card goes grey. Common cases:
+
+- **ETF flows NO DATA**: Farside sits behind Cloudflare and sometimes blocks server IPs
+  (this is why it failed before). The app now sends real browser headers, retries 3x, then
+  falls back to SoSoValue's JSON. For a rock-solid feed, paste a free **Coinglass API key**
+  in the sidebar — it's tried first.
+- **mNAV NO DATA**: needs market cap + BTC holdings + BTC price. Market cap now comes from
+  MSTR price x SEC share count, and if SEC's share endpoint is down it falls back to Yahoo's
+  market cap directly — so mNAV survives a single source outage. It only goes NO DATA if the
+  live BTC price or SEC holdings are both unavailable.
 
 ---
 
