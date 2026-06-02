@@ -18,7 +18,7 @@ Plus a scrolling **STRC/MSTR news bar**, a plain-English **situation summary**, 
 | Data | Source | How | Refresh |
 |---|---|---|---|
 | Coinbase premium | Coinbase vs Binance spot (OKX fallback) | REST | 15s |
-| ETF flows | Coinglass (key) -> Farside -> SoSoValue | API / browser-header scrape / JSON | 15m |
+| ETF flows | Coinglass(key) -> GitHub CSV -> Farside via Jina Reader -> Farside direct | multi-source, cloud-friendly | 15m |
 | STRC / MSTR price | Stooq (Yahoo fallback) | CSV / chart API | 2m |
 | **BTC holdings** | SEC EDGAR | regex scrape of Strategy's latest 8-K | 30m |
 | **Convertible debt** | SEC EDGAR | 8-K capital-structure update | 30m |

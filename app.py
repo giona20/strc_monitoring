@@ -59,6 +59,10 @@ BROWSER = {
     "Upgrade-Insecure-Requests": "1",
 }
 CIK = "0001050446"  # Strategy Inc (MSTR)
+# Default ETF flows CSV (GitHub raw is allow-listed & not behind Cloudflare).
+# Columns: Date,Total. Swap for a fresher mirror in the sidebar if needed.
+DEFAULT_ETF_CSV = ("https://raw.githubusercontent.com/canadiancode/btc-etf-flows/"
+                   "HEAD/Bitcoin-ETF-Flow-Data/data/BTC_ETF_INFLOWS_OUTFLOWS.csv")
 
 st.markdown(f"""
 <style>
@@ -119,6 +123,35 @@ def _num(v):
         f = float(s); return -f if neg else f
     except Exception:
         return None
+
+
+def _parse_farside_markdown(md):
+    """Parse the Farside flow table from Jina Reader markdown output.
+    Rows look like: | 01 Jun 2026 | (440.3) | ... | (483.8) |
+    The Total is the last numeric cell on each dated row."""
+    rows = []
+    date_re = re.compile(r"^\|?\s*(\d{1,2}\s+[A-Z][a-z]{2}\s+20\d{2})\s*\|")
+    for line in md.splitlines():
+        if "|" not in line:
+            continue
+        m = date_re.search(line.strip())
+        if not m:
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        date = cells[0]
+        # last cell that parses as a number is the Total
+        total = None
+        for c in reversed(cells[1:]):
+            v = _num(c)
+            if v is not None:
+                total = v
+                break
+        if total is not None:
+            rows.append((date, total))
+    if not rows:
+        return None
+    return {"ok": True, "date": rows[-1][0], "today": rows[-1][1],
+            "d5": sum(v for _, v in rows[-5:]), "src": "Farside (Jina)"}
 
 
 def _parse_farside_html(h):
@@ -194,30 +227,54 @@ def fetch_etf_flows(coinglass_key="", github_csv_url=""):
         try:
             txt = requests.get(github_csv_url, headers=BROWSER, timeout=12).text
             df = pd.read_csv(io.StringIO(txt))
-            # find a date col and a total/net col
-            cols = {c.lower(): c for c in df.columns}
+            df = df.dropna(how="all")
+            cols = {c.lower().strip(): c for c in df.columns}
             datec = next((cols[c] for c in cols if "date" in c), df.columns[0])
-            totalc = next((cols[c] for c in cols if c in ("total", "net", "net_flow", "sum")), None)
+            totalc = next((cols[c] for c in cols if c in ("total", "net", "net_flow", "sum", "flow")), None)
             if totalc:
                 df = df[[datec, totalc]].dropna()
                 df[totalc] = df[totalc].apply(_num)
-                df = df.dropna(subset=[totalc]).sort_values(datec)
-                return {"ok": True, "date": str(df.iloc[-1][datec]), "today": float(df.iloc[-1][totalc]),
+                df = df.dropna(subset=[totalc])
+                df["_d"] = df[datec].astype(str).str.replace("T", "", regex=False).str.strip()
+                df = df.sort_values("_d")
+                last_raw = df.iloc[-1]["_d"]
+                # format YYYYMMDD -> DD Mon YYYY when possible
+                try:
+                    import datetime as _dt
+                    last_disp = _dt.datetime.strptime(last_raw[:8], "%Y%m%d").strftime("%d %b %Y")
+                except Exception:
+                    last_disp = str(df.iloc[-1][datec])
+                return {"ok": True, "date": last_disp, "today": float(df.iloc[-1][totalc]),
                         "d5": float(df[totalc].tail(5).sum()), "src": "GitHub CSV", "tried": tried}
             tried.append("GitHub CSV: no total/net column")
         except Exception as e:
             tried.append(f"GitHub CSV err {e}")
-    # 3) Farside
-    for attempt in range(3):
+    # 3) Farside via Jina Reader proxy (r.jina.ai bypasses Cloudflare, free, no key)
+    try:
+        jr = requests.get("https://r.jina.ai/https://farside.co.uk/btc/",
+                          headers={"User-Agent": BROWSER["User-Agent"], "Accept": "text/plain",
+                                   "X-Return-Format": "markdown"}, timeout=25)
+        if jr.status_code == 200 and jr.text:
+            res = _parse_farside_markdown(jr.text)
+            if res:
+                res["tried"] = tried
+                return res
+            tried.append("Jina/Farside: parsed 0 rows")
+        else:
+            tried.append(f"Jina/Farside HTTP {jr.status_code}")
+    except Exception as e:
+        tried.append(f"Jina/Farside err {e}")
+    # 4) Farside direct (works locally, usually blocked on cloud)
+    for attempt in range(2):
         try:
             r = requests.get("https://farside.co.uk/btc/", headers=BROWSER, timeout=15)
             if "Total" in r.text:
                 out = _parse_farside_html(r.text); out["tried"] = tried; return out
-            tried.append(f"Farside HTTP {r.status_code} (no table)")
+            tried.append(f"Farside direct HTTP {r.status_code} (no table)")
             break
         except Exception as e:
-            if attempt == 2:
-                tried.append(f"Farside err {e}")
+            if attempt == 1:
+                tried.append(f"Farside direct err {e}")
             time.sleep(1)
     # 4) SoSoValue (needs x-soso-api-key; only try if provided via coinglass_key field is not it)
     # Public endpoint requires a key, so we skip unless reachable; record the attempt.
@@ -432,9 +489,10 @@ coinglass_key = st.sidebar.text_input(
     help="Optional. Makes ETF flows rock-solid. Free key at coinglass.com. "
          "Without it the app tries GitHub CSV, Farside and SoSoValue.")
 github_csv_url = st.sidebar.text_input(
-    "ETF CSV raw URL (optional)", value="",
-    help="A raw.githubusercontent.com CSV of daily BTC ETF flows with a date column "
-         "and a 'total'/'net' column. Cloud-friendly fallback that bypasses Cloudflare.")
+    "ETF CSV raw URL", value=DEFAULT_ETF_CSV,
+    help="A raw.githubusercontent.com CSV of daily BTC ETF flows with a Date column "
+         "and a 'Total'/'net' column. Cloud-friendly, bypasses Cloudflare, no key. "
+         "Replace with a more frequently-updated mirror if you find one.")
 auto_refresh = st.sidebar.checkbox("Auto-refresh (30s)", value=True)
 show_diag = st.sidebar.checkbox("Show data-source diagnostics", value=False,
     help="Shows exactly which live source succeeded or failed, with HTTP codes.")
