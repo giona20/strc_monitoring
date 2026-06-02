@@ -177,79 +177,16 @@ def _parse_farside_html(h):
 
 
 @st.cache_data(ttl=900)
-def fetch_etf_flows(coinglass_key="", github_csv_url=""):
-    """Multi-source ETF flows. Tries in order and records why each failed.
-    1) Coinglass API (needs free key)  2) GitHub raw CSV (cloud-friendly, no block)
-    3) Farside (Cloudflare)  4) SoSoValue JSON. Returns ok:False only if all fail."""
+def fetch_etf_flows():
+    """Multi-source ETF flows, live-first. Order:
+    1) Farside via Jina Reader (live, official, bypasses Cloudflare, free, no key)
+    2) Farside direct (works locally)
+    3) GitHub CSV (only if recent enough; the public mirror can lag)
+    Returns ok:False only if all fail."""
     tried = []
-    # 1) Coinglass
-    if coinglass_key:
-        try:
-            r = requests.get("https://open-api-v4.coinglass.com/api/etf/bitcoin/flow-history",
-                             headers={"CG-API-KEY": coinglass_key, "accept": "application/json"}, timeout=12)
-            j = r.json()
-            data = j.get("data", j)
-            if isinstance(data, dict):
-                data = data.get("list") or data.get("history") or data.get("flowHistory") or []
-            flows = []
-            for x in (data or []):
-                if not isinstance(x, dict):
-                    continue
-                ts = x.get("timestamp") or x.get("time") or x.get("date")
-                # total net flow under any of these likely keys
-                val = None
-                for k in ("flow_usd", "flowUsd", "total_flow_usd", "netFlow", "net_flow",
-                          "total_net_inflow", "totalNetInflow", "changeUsd", "value"):
-                    if x.get(k) is not None:
-                        val = x[k]; break
-                if ts is not None and val is not None:
-                    try:
-                        flows.append((int(ts), float(val) / 1e6))
-                    except Exception:
-                        pass
-            if flows:
-                flows.sort()
-                import datetime as _dt
-                ms = flows[-1][0]
-                ds = _dt.datetime.utcfromtimestamp(ms / 1000 if ms > 1e12 else ms).strftime("%d %b %Y")
-                return {"ok": True, "date": ds, "today": flows[-1][1],
-                        "d5": sum(f for _, f in flows[-5:]), "src": "Coinglass", "tried": tried}
-            # nothing parsed: record what keys we actually saw to debug
-            sample = (data[0] if isinstance(data, list) and data else data)
-            keys = list(sample.keys())[:8] if isinstance(sample, dict) else str(type(sample))
-            tried.append(f"Coinglass HTTP {r.status_code} parsed 0 rows; sample keys={keys}; msg={j.get('msg','')}")
-        except Exception as e:
-            tried.append(f"Coinglass err {e}")
-    else:
-        tried.append("Coinglass skipped (no key)")
-    # 2) GitHub raw CSV (only if user supplied a URL; raw.githubusercontent.com is allow-listed)
-    if github_csv_url:
-        try:
-            txt = requests.get(github_csv_url, headers=BROWSER, timeout=12).text
-            df = pd.read_csv(io.StringIO(txt))
-            df = df.dropna(how="all")
-            cols = {c.lower().strip(): c for c in df.columns}
-            datec = next((cols[c] for c in cols if "date" in c), df.columns[0])
-            totalc = next((cols[c] for c in cols if c in ("total", "net", "net_flow", "sum", "flow")), None)
-            if totalc:
-                df = df[[datec, totalc]].dropna()
-                df[totalc] = df[totalc].apply(_num)
-                df = df.dropna(subset=[totalc])
-                df["_d"] = df[datec].astype(str).str.replace("T", "", regex=False).str.strip()
-                df = df.sort_values("_d")
-                last_raw = df.iloc[-1]["_d"]
-                # format YYYYMMDD -> DD Mon YYYY when possible
-                try:
-                    import datetime as _dt
-                    last_disp = _dt.datetime.strptime(last_raw[:8], "%Y%m%d").strftime("%d %b %Y")
-                except Exception:
-                    last_disp = str(df.iloc[-1][datec])
-                return {"ok": True, "date": last_disp, "today": float(df.iloc[-1][totalc]),
-                        "d5": float(df[totalc].tail(5).sum()), "src": "GitHub CSV", "tried": tried}
-            tried.append("GitHub CSV: no total/net column")
-        except Exception as e:
-            tried.append(f"GitHub CSV err {e}")
-    # 3) Farside via Jina Reader proxy (r.jina.ai bypasses Cloudflare, free, no key)
+    import datetime as _dt
+
+    # 1) Farside via Jina Reader proxy
     try:
         jr = requests.get("https://r.jina.ai/https://farside.co.uk/btc/",
                           headers={"User-Agent": BROWSER["User-Agent"], "Accept": "text/plain",
@@ -259,12 +196,13 @@ def fetch_etf_flows(coinglass_key="", github_csv_url=""):
             if res:
                 res["tried"] = tried
                 return res
-            tried.append("Jina/Farside: parsed 0 rows")
+            tried.append("Jina/Farside parsed 0 rows")
         else:
             tried.append(f"Jina/Farside HTTP {jr.status_code}")
     except Exception as e:
         tried.append(f"Jina/Farside err {e}")
-    # 4) Farside direct (works locally, usually blocked on cloud)
+
+    # 2) Farside direct
     for attempt in range(2):
         try:
             r = requests.get("https://farside.co.uk/btc/", headers=BROWSER, timeout=15)
@@ -276,9 +214,37 @@ def fetch_etf_flows(coinglass_key="", github_csv_url=""):
             if attempt == 1:
                 tried.append(f"Farside direct err {e}")
             time.sleep(1)
-    # 4) SoSoValue (needs x-soso-api-key; only try if provided via coinglass_key field is not it)
-    # Public endpoint requires a key, so we skip unless reachable; record the attempt.
-    tried.append("SoSoValue skipped (needs x-soso-api-key)")
+
+    # 3) GitHub CSV mirror (last resort; reject if the latest row is > 10 days old)
+    try:
+        txt = requests.get(DEFAULT_ETF_CSV, headers=BROWSER, timeout=12).text
+        df = pd.read_csv(io.StringIO(txt))
+        df = df.dropna(how="all")
+        cols = {c.lower().strip(): c for c in df.columns}
+        datec = next((cols[c] for c in cols if "date" in c), df.columns[0])
+        totalc = next((cols[c] for c in cols if c in ("total", "net", "net_flow", "sum", "flow")), None)
+        if totalc:
+            df = df[[datec, totalc]].dropna()
+            df[totalc] = df[totalc].apply(_num)
+            df = df.dropna(subset=[totalc])
+            df["_d"] = df[datec].astype(str).str.replace("T", "", regex=False).str.strip()
+            df = df.sort_values("_d")
+            last_raw = df.iloc[-1]["_d"]
+            try:
+                last_dt = _dt.datetime.strptime(last_raw[:8], "%Y%m%d")
+                age_days = (_dt.datetime.utcnow() - last_dt).days
+                last_disp = last_dt.strftime("%d %b %Y")
+            except Exception:
+                last_dt = None; age_days = 999; last_disp = str(df.iloc[-1][datec])
+            if age_days <= 10:
+                return {"ok": True, "date": last_disp, "today": float(df.iloc[-1][totalc]),
+                        "d5": float(df[totalc].tail(5).sum()), "src": "GitHub CSV", "tried": tried}
+            tried.append(f"GitHub CSV stale ({last_disp}, {age_days}d old)")
+        else:
+            tried.append("GitHub CSV: no total/net column")
+    except Exception as e:
+        tried.append(f"GitHub CSV err {e}")
+
     return {"ok": False, "err": " | ".join(tried), "tried": tried}
 
 
@@ -484,27 +450,17 @@ def verdict(s):
 # SIDEBAR
 # ============================================================================
 st.sidebar.markdown("### SETTINGS")
-coinglass_key = st.sidebar.text_input(
-    "Coinglass API key (optional)", value="", type="password",
-    help="Optional. Makes ETF flows rock-solid. Free key at coinglass.com. "
-         "Without it the app tries GitHub CSV, Farside and SoSoValue.")
-github_csv_url = st.sidebar.text_input(
-    "ETF CSV raw URL", value=DEFAULT_ETF_CSV,
-    help="A raw.githubusercontent.com CSV of daily BTC ETF flows with a Date column "
-         "and a 'Total'/'net' column. Cloud-friendly, bypasses Cloudflare, no key. "
-         "Replace with a more frequently-updated mirror if you find one.")
 auto_refresh = st.sidebar.checkbox("Auto-refresh (30s)", value=True)
 show_diag = st.sidebar.checkbox("Show data-source diagnostics", value=False,
     help="Shows exactly which live source succeeded or failed, with HTTP codes.")
-st.sidebar.caption("All other data is fetched live and automatically. "
-                   "No values are entered by hand.")
+st.sidebar.caption("All data is fetched live and automatically. No values are entered by hand.")
 
 # ============================================================================
 # FETCH EVERYTHING LIVE
 # ============================================================================
 with st.spinner("Pulling live data from Coinbase, ETF sources, Stooq, SEC EDGAR, Yahoo…"):
     p = fetch_premium()
-    etf = fetch_etf_flows(coinglass_key, github_csv_url)
+    etf = fetch_etf_flows()
     strc_price, strc_src = price_of("strc.us", "STRC")
     mstr_price, mstr_src = price_of("mstr.us", "MSTR")
     fund = fetch_strategy_fundamentals()
