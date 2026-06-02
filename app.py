@@ -153,15 +153,38 @@ def fetch_etf_flows(coinglass_key="", github_csv_url=""):
     if coinglass_key:
         try:
             r = requests.get("https://open-api-v4.coinglass.com/api/etf/bitcoin/flow-history",
-                             headers={"CG-API-KEY": coinglass_key, "Accept": "application/json"}, timeout=12)
-            rows = sorted(r.json().get("data", []), key=lambda x: x.get("timestamp", 0))
-            flows = [(x["timestamp"], x.get("flow_usd", 0) / 1e6) for x in rows if "flow_usd" in x]
+                             headers={"CG-API-KEY": coinglass_key, "accept": "application/json"}, timeout=12)
+            j = r.json()
+            data = j.get("data", j)
+            if isinstance(data, dict):
+                data = data.get("list") or data.get("history") or data.get("flowHistory") or []
+            flows = []
+            for x in (data or []):
+                if not isinstance(x, dict):
+                    continue
+                ts = x.get("timestamp") or x.get("time") or x.get("date")
+                # total net flow under any of these likely keys
+                val = None
+                for k in ("flow_usd", "flowUsd", "total_flow_usd", "netFlow", "net_flow",
+                          "total_net_inflow", "totalNetInflow", "changeUsd", "value"):
+                    if x.get(k) is not None:
+                        val = x[k]; break
+                if ts is not None and val is not None:
+                    try:
+                        flows.append((int(ts), float(val) / 1e6))
+                    except Exception:
+                        pass
             if flows:
+                flows.sort()
                 import datetime as _dt
-                d = _dt.datetime.utcfromtimestamp(flows[-1][0] / 1000).strftime("%d %b %Y")
-                return {"ok": True, "date": d, "today": flows[-1][1],
+                ms = flows[-1][0]
+                ds = _dt.datetime.utcfromtimestamp(ms / 1000 if ms > 1e12 else ms).strftime("%d %b %Y")
+                return {"ok": True, "date": ds, "today": flows[-1][1],
                         "d5": sum(f for _, f in flows[-5:]), "src": "Coinglass", "tried": tried}
-            tried.append(f"Coinglass HTTP {r.status_code} (no rows)")
+            # nothing parsed: record what keys we actually saw to debug
+            sample = (data[0] if isinstance(data, list) and data else data)
+            keys = list(sample.keys())[:8] if isinstance(sample, dict) else str(type(sample))
+            tried.append(f"Coinglass HTTP {r.status_code} parsed 0 rows; sample keys={keys}; msg={j.get('msg','')}")
         except Exception as e:
             tried.append(f"Coinglass err {e}")
     else:
