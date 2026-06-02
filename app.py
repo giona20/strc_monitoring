@@ -125,14 +125,21 @@ def _num(v):
 
 def _parse_farside_html(h):
     tables = pd.read_html(io.StringIO(h))
+    if not tables:
+        raise ValueError("no tables")
     df = max(tables, key=lambda t: t.shape[0] * t.shape[1])
     df.columns = [str(c[-1]) if isinstance(c, tuple) else str(c) for c in df.columns]
-    tcol = [c for c in df.columns if c.strip().lower() == "total"][0]
+    tcols = [c for c in df.columns if c.strip().lower() == "total"]
+    if not tcols:
+        raise ValueError("no Total column (likely Cloudflare challenge page)")
+    tcol = tcols[0]
     labels = df.iloc[:, 0].astype(str)
     mask = ~labels.str.strip().str.lower().isin(["total", "average", "maximum", "minimum", "nan"])
     data = df[mask].copy()
     data["net"] = data[tcol].apply(_num)
     data = data.dropna(subset=["net"])
+    if data.empty:
+        raise ValueError("no data rows")
     latest = data.iloc[-1]
     return {"ok": True, "date": str(latest.iloc[0]), "today": float(latest["net"]),
             "d5": float(data["net"].tail(5).sum()), "src": "Farside"}
@@ -191,26 +198,9 @@ def fetch_etf_flows(coinglass_key="", github_csv_url=""):
             if attempt == 2:
                 tried.append(f"Farside err {e}")
             time.sleep(1)
-    # 4) SoSoValue
-    try:
-        r = requests.get("https://api.sosovalue.com/openapi/v2/etf/historicalInflowChart",
-                         headers={**BROWSER, "Accept": "application/json"},
-                         params={"type": "us-btc-spot"}, timeout=12)
-        j = r.json()
-        rows = j.get("data", {}).get("list") or j.get("data") or []
-        norm = []
-        for x in rows:
-            v = x.get("totalNetInflow", x.get("flow_usd"))
-            dt = x.get("date") or x.get("timestamp")
-            if v is not None and dt is not None:
-                norm.append((str(dt), float(v) / 1e6))
-        if norm:
-            norm.sort()
-            return {"ok": True, "date": norm[-1][0], "today": norm[-1][1],
-                    "d5": sum(v for _, v in norm[-5:]), "src": "SoSoValue", "tried": tried}
-        tried.append(f"SoSoValue HTTP {r.status_code} (no rows)")
-    except Exception as e:
-        tried.append(f"SoSoValue err {e}")
+    # 4) SoSoValue (needs x-soso-api-key; only try if provided via coinglass_key field is not it)
+    # Public endpoint requires a key, so we skip unless reachable; record the attempt.
+    tried.append("SoSoValue skipped (needs x-soso-api-key)")
     return {"ok": False, "err": " | ".join(tried), "tried": tried}
 
 
@@ -244,12 +234,16 @@ def price_of(stooq_sym, yahoo_sym):
     return None, None
 
 
-# ---- SEC 8-K live scraper ---------------------------------------------------
+# ---- SEC 8-K live scraper (regexes work on tag-stripped HTML: spaces, not pipes) ----
 def _btc_holdings(t):
-    m = re.search(r"Aggregate BTC Holdings.*?\|\s*([\d,]{6,})\s*\|", t, re.S | re.I)
-    if m: return int(m.group(1).replace(",", ""))
     m = re.search(r"holds?\s+([\d,]{6,})\s+bitcoin", t, re.I)
     if m: return int(m.group(1).replace(",", ""))
+    seg = re.search(r"Aggregate BTC Holdings(.{0,400})", t, re.S | re.I)
+    if seg:
+        for num in re.findall(r"(\d{3},\d{3}(?:,\d{3})*)", seg.group(1)):
+            v = int(num.replace(",", ""))
+            if v > 100000:
+                return v
     return None
 
 def _debt_m(t):
@@ -270,12 +264,11 @@ def _reserve_m(t):
     return None
 
 def _strc_rate(t):
-    m = re.search(r"Stretch Preferred Stock.*?at\s+([\d.]+)%", t, re.S | re.I)
+    m = re.search(r"Stretch Preferred Stock[^%]*?at\s+([\d.]+)%", t, re.S | re.I)
     if m: return float(m.group(1))
     return None
 
 def _bps_sats(t):
-    # "220,900 Bitcoin Per Share (in sats)"
     m = re.search(r"([\d,]{4,})\s+Bitcoin Per Share", t, re.I)
     if m: return int(m.group(1).replace(",", ""))
     return None
