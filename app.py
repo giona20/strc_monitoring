@@ -43,13 +43,11 @@ SEC_HEADERS = {
     "User-Agent": "FourHorsemen Dashboard giofanale@gmail.com",
     "Accept": "application/json, text/html, */*",
     "Accept-Encoding": "gzip, deflate",
-    "Host": "data.sec.gov",
 }
 SEC_ARCHIVE_HEADERS = {
     "User-Agent": "FourHorsemen Dashboard giofanale@gmail.com",
     "Accept": "text/html, */*",
     "Accept-Encoding": "gzip, deflate",
-    "Host": "www.sec.gov",
 }
 # Browser-like headers to get past Cloudflare bot detection (Farside, etc.)
 BROWSER = {
@@ -280,17 +278,18 @@ def fetch_strategy_fundamentals():
     Returns dict of values; each key is None if not found in any recent filing."""
     out = {"btc": None, "debt_m": None, "pref_m": None, "reserve_m": None,
            "strc_rate": None, "bps_sats": None, "shares_m": None,
-           "filing_date": None, "err": None, "http": None, "checked": 0}
+           "filing_date": None, "err": None, "http": None, "checked": 0, "doc_log": []}
     try:
         r0 = requests.get(f"https://data.sec.gov/submissions/CIK{CIK}.json", headers=SEC_HEADERS, timeout=12)
         out["http"] = r0.status_code
         if r0.status_code != 200:
-            out["err"] = f"submissions HTTP {r0.status_code}"
+            out["err"] = f"submissions HTTP {r0.status_code}: {r0.text[:120]}"
             return out
         sub = r0.json()
         recent = sub["filings"]["recent"]
         forms = recent["form"]; accns = recent["accessionNumber"]
         docs = recent["primaryDocument"]; dates = recent["filingDate"]
+        out["doc_log"].append(f"submissions OK, {len(forms)} filings, company={sub.get('name','?')}")
         checked = 0
         for i in range(len(forms)):
             if forms[i] != "8-K":
@@ -301,10 +300,15 @@ def fetch_strategy_fundamentals():
             acc = accns[i].replace("-", "")
             url = f"https://www.sec.gov/Archives/edgar/data/{int(CIK)}/{acc}/{docs[i]}"
             try:
-                t = requests.get(url, headers=SEC_ARCHIVE_HEADERS, timeout=12).text
-                t = re.sub(r"<[^>]+>", " ", t)
+                rr = requests.get(url, headers=SEC_ARCHIVE_HEADERS, timeout=12)
+                raw = rr.text
+                t = re.sub(r"<[^>]+>", " ", raw)
                 t = html.unescape(re.sub(r"\s+", " ", t))
-            except Exception:
+                if checked <= 3:
+                    hit = "BTC" if ("bitcoin" in t.lower() or "btc holdings" in t.lower()) else "no-btc"
+                    out["doc_log"].append(f"8-K {dates[i]} HTTP {rr.status_code} len={len(t)} {hit} doc={docs[i]}")
+            except Exception as e:
+                out["doc_log"].append(f"8-K {dates[i]} fetch ERR {e}")
                 continue
             if out["filing_date"] is None:
                 out["filing_date"] = dates[i]
@@ -317,12 +321,11 @@ def fetch_strategy_fundamentals():
             if all(out[k] is not None for k in ("btc", "debt_m", "pref_m", "reserve_m", "strc_rate", "bps_sats")):
                 break
         out["checked"] = checked
-        # derive assumed-diluted shares from BPS: shares = holdings * 1e8 / bps_sats
         if out["btc"] and out["bps_sats"]:
             out["shares_m"] = (out["btc"] * 1e8 / out["bps_sats"]) / 1e6
         return out
     except Exception as e:
-        out["err"] = str(e)
+        out["err"] = f"{type(e).__name__}: {e}"
         return out
 
 
@@ -635,6 +638,8 @@ if show_diag:
                   f"BTC={btc_holdings}, debt={debt_m}, pref={preferred_m}, reserve={cash_m}, "
                   f"BPS={fund.get('bps_sats')}, strc_rate={strc_rate}"
                   if btc_holdings else f"FAIL: HTTP {fund.get('http')} / {fund.get('err','?')}"))
+    for dl in fund.get("doc_log", []):
+        lines.append(f"&nbsp;&nbsp;&nbsp;↳ {dl}")
     lines.append(f"{stat(shares_m is not None)} **Shares** — " +
                  (f"{shares_m:,.1f}M via {shares_src}" if shares_m else "FAIL: no BPS, no XBRL"))
     lines.append(f"{stat(mcap is not None)} **Market cap** — " +
