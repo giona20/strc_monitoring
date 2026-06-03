@@ -59,6 +59,7 @@ BROWSER = {
     "Upgrade-Insecure-Requests": "1",
 }
 CIK = "0001050446"  # Strategy Inc (MSTR)
+BUILD = "v7-pending-etf"  # bump on each deploy to confirm the running version
 # Default ETF flows CSV (GitHub raw is allow-listed & not behind Cloudflare).
 # Columns: Date,Total. Swap for a fresher mirror in the sidebar if needed.
 DEFAULT_ETF_CSV = ("https://raw.githubusercontent.com/canadiancode/btc-etf-flows/"
@@ -209,7 +210,7 @@ def _parse_farside_html(h):
             "pending": pending, "pending_date": pending_date}
 
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=300)
 def fetch_etf_flows():
     """Multi-source ETF flows, live-first. Order:
     1) Farside via Jina Reader (live, official, bypasses Cloudflare, free, no key)
@@ -483,6 +484,9 @@ def verdict(s):
 # SIDEBAR
 # ============================================================================
 st.sidebar.markdown("### SETTINGS")
+if st.sidebar.button("🔄 Refresh data now (clear cache)"):
+    st.cache_data.clear()
+    st.rerun()
 auto_refresh = st.sidebar.checkbox("Auto-refresh (30s)", value=True)
 show_diag = st.sidebar.checkbox("Show data-source diagnostics", value=False,
     help="Shows exactly which live source succeeded or failed, with HTTP codes.")
@@ -564,7 +568,7 @@ h1, h2 = st.columns([3, 1])
 with h1:
     st.markdown("<h1 style='font-size:34px;margin-bottom:0'>THE FOUR HORSEMEN</h1>", unsafe_allow_html=True)
     fdate = fund.get("filing_date") or "n/a"
-    st.markdown(f"<div style='color:{C['dim']};font-size:12px'>All data live &middot; Strategy fundamentals from 8-K dated {fdate}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='color:{C['dim']};font-size:12px'>All data live &middot; Strategy fundamentals from 8-K dated {fdate} &middot; {BUILD}</div>", unsafe_allow_html=True)
 with h2:
     cs = f"{composite:.0f}/100" if composite is not None else "—"
     st.markdown(f"<div style='text-align:right'><span style='color:{comp_color};font-size:14px'>* {comp_label}</span>"
