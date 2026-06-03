@@ -152,14 +152,28 @@ def _parse_farside_markdown(md):
             rows.append((date, total))
     if not rows:
         return None
-    # Determine the latest day with a real (non-zero) reported flow.
+    # Rows should be oldest->newest. Guard against reverse order: if the first
+    # date is newer than the last, flip it.
+    def _key(d):
+        try:
+            import datetime as _dt
+            return _dt.datetime.strptime(d, "%d %b %Y")
+        except Exception:
+            return None
+    k0, kn = _key(rows[0][0]), _key(rows[-1][0])
+    if k0 and kn and k0 > kn:
+        rows = rows[::-1]
+    # The latest reported day may be 0.0 because flows publish after US close.
+    # Treat any trailing near-zero day(s) as 'pending' and report the last day
+    # that actually has a non-zero flow.
     pending = False
     pending_date = None
-    real_rows = rows
-    if rows[-1][1] == 0.0:
-        pending = True
-        pending_date = rows[-1][0]
-        real_rows = rows[:-1] or rows
+    real_rows = list(rows)
+    while len(real_rows) > 1 and abs(real_rows[-1][1]) < 1e-9:
+        if not pending:
+            pending = True
+            pending_date = real_rows[-1][0]
+        real_rows.pop()
     latest = real_rows[-1]
     return {"ok": True, "date": latest[0], "today": latest[1],
             "d5": sum(v for _, v in real_rows[-5:]), "src": "Farside (Jina)",
@@ -183,13 +197,14 @@ def _parse_farside_html(h):
     data = data.dropna(subset=["net"])
     if data.empty:
         raise ValueError("no data rows")
-    nets = list(data["net"])
+    nets = [float(x) for x in data["net"]]
     dates = list(data.iloc[:, 0].astype(str))
     pending = False; pending_date = None
-    if nets[-1] == 0.0:
-        pending = True; pending_date = dates[-1]
-        nets = nets[:-1] or nets; dates = dates[:-1] or dates
-    return {"ok": True, "date": dates[-1], "today": float(nets[-1]),
+    while len(nets) > 1 and abs(nets[-1]) < 1e-9:
+        if not pending:
+            pending = True; pending_date = dates[-1]
+        nets.pop(); dates.pop()
+    return {"ok": True, "date": dates[-1], "today": nets[-1],
             "d5": float(sum(nets[-5:])), "src": "Farside",
             "pending": pending, "pending_date": pending_date}
 
