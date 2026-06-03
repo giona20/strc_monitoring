@@ -706,7 +706,9 @@ if show_diag:
     lines.append(f"{stat(p.get('ok'))} **Coinbase premium** — " +
                  (f"OK via {p.get('ref_name')}" if p.get("ok") else f"FAIL: {p.get('err','?')}"))
     lines.append(f"{stat(etf.get('ok'))} **ETF flows** — " +
-                 (f"OK via {etf.get('src')}: today {etf.get('today'):.1f}M" if etf.get("ok")
+                 (f"OK via {etf.get('src')}: {etf.get('date')} = {etf.get('today'):.1f}M"
+                  + (f" (today {etf.get('pending_date')} pending)" if etf.get("pending") else "")
+                  if etf.get("ok")
                   else f"FAIL. Attempts: {' | '.join(etf.get('tried', []))}"))
     lines.append(f"{stat(strc_price is not None)} **STRC price** — " +
                  (f"${strc_price:,.2f} via {strc_src}" if strc_price else "FAIL: Stooq + Yahoo both down"))
