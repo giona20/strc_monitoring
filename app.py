@@ -128,7 +128,10 @@ def _num(v):
 def _parse_farside_markdown(md):
     """Parse the Farside flow table from Jina Reader markdown output.
     Rows look like: | 01 Jun 2026 | (440.3) | ... | (483.8) |
-    The Total is the last numeric cell on each dated row."""
+    The Total is the last numeric cell on each dated row.
+    A trailing 0.0 on the latest row usually means 'not yet reported' (flows
+    publish after US market close, ~21:00-23:00 UTC, skipping weekends/holidays),
+    so we flag it as pending and report the last day that actually has data."""
     rows = []
     date_re = re.compile(r"^\|?\s*(\d{1,2}\s+[A-Z][a-z]{2}\s+20\d{2})\s*\|")
     for line in md.splitlines():
@@ -139,7 +142,6 @@ def _parse_farside_markdown(md):
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         date = cells[0]
-        # last cell that parses as a number is the Total
         total = None
         for c in reversed(cells[1:]):
             v = _num(c)
@@ -150,8 +152,18 @@ def _parse_farside_markdown(md):
             rows.append((date, total))
     if not rows:
         return None
-    return {"ok": True, "date": rows[-1][0], "today": rows[-1][1],
-            "d5": sum(v for _, v in rows[-5:]), "src": "Farside (Jina)"}
+    # Determine the latest day with a real (non-zero) reported flow.
+    pending = False
+    pending_date = None
+    real_rows = rows
+    if rows[-1][1] == 0.0:
+        pending = True
+        pending_date = rows[-1][0]
+        real_rows = rows[:-1] or rows
+    latest = real_rows[-1]
+    return {"ok": True, "date": latest[0], "today": latest[1],
+            "d5": sum(v for _, v in real_rows[-5:]), "src": "Farside (Jina)",
+            "pending": pending, "pending_date": pending_date}
 
 
 def _parse_farside_html(h):
@@ -171,9 +183,15 @@ def _parse_farside_html(h):
     data = data.dropna(subset=["net"])
     if data.empty:
         raise ValueError("no data rows")
-    latest = data.iloc[-1]
-    return {"ok": True, "date": str(latest.iloc[0]), "today": float(latest["net"]),
-            "d5": float(data["net"].tail(5).sum()), "src": "Farside"}
+    nets = list(data["net"])
+    dates = list(data.iloc[:, 0].astype(str))
+    pending = False; pending_date = None
+    if nets[-1] == 0.0:
+        pending = True; pending_date = dates[-1]
+        nets = nets[:-1] or nets; dates = dates[:-1] or dates
+    return {"ok": True, "date": dates[-1], "today": float(nets[-1]),
+            "d5": float(sum(nets[-5:])), "src": "Farside",
+            "pending": pending, "pending_date": pending_date}
 
 
 @st.cache_data(ttl=900)
@@ -563,8 +581,11 @@ def situation():
         parts.append(f"MSTR mNAV is {ev_txt}**{mnav_eq:.2f}×** on equity. "
                      f"{'On equity it is below 1.0 — the stock is worth less than its bare bitcoin, the capitulation zone.' if mnav_eq<1.0 else 'Still a premium to its bitcoin backing.'}")
     if etf_5d is not None:
-        parts.append(f"Spot BTC ETFs: **{'+' if etf_today>=0 else '-'}${abs(etf_today):.0f}M** last day, "
-                     f"**{'+' if etf_5d>=0 else '-'}${abs(etf_5d):.0f}M** over 5d — {'money leaving' if etf_5d<0 else 'money flowing in'}.")
+        when = "last reported day" if etf.get("pending") else "last day"
+        tail = " (today's figure not yet published)" if etf.get("pending") else ""
+        parts.append(f"Spot BTC ETFs: **{'+' if etf_today>=0 else '-'}${abs(etf_today):.0f}M** {when}, "
+                     f"**{'+' if etf_5d>=0 else '-'}${abs(etf_5d):.0f}M** over 5d — "
+                     f"{'money leaving' if etf_5d<0 else 'money flowing in'}{tail}.")
     if prem is not None:
         parts.append(f"Coinbase premium is **{prem:+.3f}%** — US spot is {'selling harder than offshore' if prem<0 else 'bidding'}.")
     bear = sum([
@@ -640,9 +661,16 @@ else:
 if etf.get("ok"):
     et = f"{'+' if etf_today>=0 else '-'}${abs(etf_today):.1f}M"
     e5 = f"{'+' if etf_5d>=0 else '-'}${abs(etf_5d):.1f}M"
+    if etf.get("pending"):
+        pd_date = etf.get("pending_date", "today")
+        sub = f"{etf['date']} (last reported) &middot; 5d {e5}"
+        extra = (f"<div class='hm-sub' style='margin-top:8px'>{pd_date} not yet reported "
+                 f"— flows publish after US close &middot; via {etf.get('src','?')}</div>")
+    else:
+        sub = f"{etf['date']} &middot; 5d {e5}"
+        extra = f"<div class='hm-sub' style='margin-top:8px'>live via {etf.get('src','?')}</div>"
     card(c3, "3. SPOT BTC ETF FLOWS", scores.get("etf"), et,
-         C["red"] if etf_today < 0 else C["green"], f"{etf['date']} &middot; 5d {e5}",
-         extra=f"<div class='hm-sub' style='margin-top:8px'>live via {etf.get('src','?')}</div>", flag=etf_5d < -500)
+         C["red"] if etf_today < 0 else C["green"], sub, extra=extra, flag=etf_5d < -500)
 else:
     card(c3, "3. SPOT BTC ETF FLOWS", None, "", "", "all ETF sources unavailable")
 
